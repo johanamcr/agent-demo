@@ -169,32 +169,42 @@ with col_panel:
 
             # Filtro por rango de años
             if "Año" in df_res.columns and df_res["Año"].notna().any():
-                min_year = int(df_res["Año"].min())
-                max_year = int(df_res["Año"].max())
-                year_range = col_f1.slider(
-                    "Rango de años",
-                    min_value=min_year,
-                    max_value=max_year,
-                    value=(min_year, max_year),
-                    step=1,
-                )
-                df_res = df_res[
-                    (df_res["Año"] >= year_range[0])
-                    & (df_res["Año"] <= year_range[1])
-                ]
+                años_validos = sorted(df_res["Año"].dropna().unique().tolist())
+
+                if len(años_validos) > 1:
+                    min_year = int(min(años_validos))
+                    max_year = int(max(años_validos))
+                    year_range = col_f1.slider(
+                        "Rango de años",
+                        min_value=min_year,
+                        max_value=max_year,
+                        value=(min_year, max_year),
+                        step=1,
+                    )
+                    df_res = df_res[
+                        (df_res["Año"] >= year_range[0])
+                        & (df_res["Año"] <= year_range[1])
+                    ]
+                else:
+                    # Solo hay un año en los resultados → no usamos slider
+                    unico = int(años_validos[0])
+                    col_f1.write(f"Todos los resultados son del año **{unico}**.")
             else:
-                year_range = None
+                col_f1.write("No hay información de año en los resultados.")
 
             # Filtro por país
             if "País" in df_res.columns:
                 paises_unicos = sorted(df_res["País"].dropna().unique().tolist())
-                paises_sel = col_f2.multiselect(
-                    "Filtrar por país",
-                    options=paises_unicos,
-                    default=paises_unicos,
-                )
-                if paises_sel:
-                    df_res = df_res[df_res["País"].isin(paises_sel)]
+                if paises_unicos:
+                    paises_sel = col_f2.multiselect(
+                        "Filtrar por país",
+                        options=paises_unicos,
+                        default=paises_unicos,
+                    )
+                    if paises_sel:
+                        df_res = df_res[df_res["País"].isin(paises_sel)]
+                else:
+                    col_f2.write("No hay países disponibles para filtrar.")
 
         # ── Métricas ───────────────────────────
         col_m1, col_m2, col_m3 = st.columns(3)
