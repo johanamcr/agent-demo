@@ -12,11 +12,11 @@ st.write(
     """
 Este demo muestra cómo podría funcionar un **agente** sobre CGSpace:
 
-- A la izquierda escribes una pregunta o tema.
+- A la izquierda escribes una pregunta o tema (chat).
 - El agente busca en un subconjunto local de metadatos de CGSpace (archivo CSV).
-- A la derecha ves los documentos encontrados, con enlaces al repositorio.
+- A la derecha ves métricas, filtros, gráfico y la lista de documentos encontrados.
 
-Más adelante, este mismo diseño se puede conectar a la **API de CGSpace** en producción.
+En producción, este mismo diseño se puede conectar a la **API REST de CGSpace**.
 """
 )
 
@@ -44,9 +44,9 @@ if "results_df" not in st.session_state:
     st.session_state.results_df = df_base.copy()
 
 # ─────────────────────────────────────────────
-# Función de búsqueda local (mini "tool" del agente)
+# Herramienta del agente: búsqueda local
 # ─────────────────────────────────────────────
-def buscar_localmente(query: str, df: pd.DataFrame, max_results: int = 50) -> pd.DataFrame:
+def buscar_localmente(query: str, df: pd.DataFrame, max_results: int = 200) -> pd.DataFrame:
     """
     Busca la query en varias columnas de texto del DataFrame:
     - Título
@@ -83,7 +83,7 @@ def buscar_localmente(query: str, df: pd.DataFrame, max_results: int = 50) -> pd
 
 
 # ─────────────────────────────────────────────
-# Layout: chat (izquierda) + panel de resultados (derecha)
+# Layout principal: chat (izquierda) + panel de datos (derecha)
 # ─────────────────────────────────────────────
 col_chat, col_panel = st.columns([1, 2])
 
@@ -106,11 +106,13 @@ with col_chat:
         with st.chat_message("user"):
             st.markdown(user_input)
 
-        # "Herramienta" del agente: búsqueda en datos locales
-        df_resultados = buscar_localmente(user_input, df_base, max_results=50)
+        # 1) Búsqueda primaria en los datos locales (tool del agente)
+        df_resultados = buscar_localmente(user_input, df_base, max_results=200)
+
+        # Guardamos sin filtros (después filtramos por país/año en el panel)
         st.session_state.results_df = df_resultados
 
-        # Construir respuesta simple del agente
+        # 2) Construir respuesta de texto del agente
         if df_resultados.empty:
             respuesta = (
                 "He buscado en el subconjunto local de CGSpace y **no encontré documentos** "
@@ -120,7 +122,6 @@ with col_chat:
             )
         else:
             n = len(df_resultados)
-            # Años y países presentes
             if "Año" in df_resultados.columns:
                 años_min = int(df_resultados["Año"].min())
                 años_max = int(df_resultados["Año"].max())
@@ -142,7 +143,7 @@ with col_chat:
                 f"- Rango de años en los resultados: **{rango_años}**\n"
                 f"- Países presentes: **{paises}**\n\n"
                 f"Algunos títulos de ejemplo:\n{titulos_ejemplo}\n\n"
-                "Puedes ver la lista completa en el panel de la derecha."
+                "Puedes refinar por año o país en el panel de la derecha."
             )
 
         st.session_state.messages.append({"role": "assistant", "content": respuesta})
@@ -162,5 +163,67 @@ with col_panel:
             "**climate change**, **Colombia**, etc."
         )
     else:
-        st.metric("Documentos encontrados", len(df_res))
+        # ── Filtros interactivos ───────────────────────────
+        with st.expander("Filtros (año, país)", expanded=True):
+            col_f1, col_f2 = st.columns(2)
+
+            # Filtro por rango de años
+            if "Año" in df_res.columns and df_res["Año"].notna().any():
+                min_year = int(df_res["Año"].min())
+                max_year = int(df_res["Año"].max())
+                year_range = col_f1.slider(
+                    "Rango de años",
+                    min_value=min_year,
+                    max_value=max_year,
+                    value=(min_year, max_year),
+                    step=1,
+                )
+                df_res = df_res[
+                    (df_res["Año"] >= year_range[0])
+                    & (df_res["Año"] <= year_range[1])
+                ]
+            else:
+                year_range = None
+
+            # Filtro por país
+            if "País" in df_res.columns:
+                paises_unicos = sorted(df_res["País"].dropna().unique().tolist())
+                paises_sel = col_f2.multiselect(
+                    "Filtrar por país",
+                    options=paises_unicos,
+                    default=paises_unicos,
+                )
+                if paises_sel:
+                    df_res = df_res[df_res["País"].isin(paises_sel)]
+
+        # ── Métricas ───────────────────────────
+        col_m1, col_m2, col_m3 = st.columns(3)
+
+        col_m1.metric("Documentos encontrados", len(df_res))
+
+        if "Año" in df_res.columns and not df_res.empty:
+            col_m2.metric(
+                "Año más reciente",
+                int(df_res["Año"].max()),
+            )
+        else:
+            col_m2.metric("Año más reciente", "N/D")
+
+        if "País" in df_res.columns and not df_res.empty:
+            col_m3.metric(
+                "Nº de países en resultados",
+                df_res["País"].nunique(),
+            )
+        else:
+            col_m3.metric("Nº de países en resultados", "N/D")
+
+        # ── Gráfico simple: nº de docs por año ───────────────────────────
+        if "Año" in df_res.columns and not df_res.empty:
+            st.markdown("### Documentos por año")
+            docs_por_anio = df_res.groupby("Año").size().reset_index(name="Documentos")
+            docs_por_anio = docs_por_anio.sort_values("Año")
+            st.bar_chart(docs_por_anio.set_index("Año"))
+
+        # ── Tabla de resultados ───────────────────────────
+        st.markdown("### Lista de documentos")
         st.dataframe(df_res, use_container_width=True)
