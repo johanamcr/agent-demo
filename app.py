@@ -1,30 +1,47 @@
 import streamlit as st
 import pandas as pd
+import requests
 
 # ─────────────────────────────────────────────
 # Configuración de la página
 # ─────────────────────────────────────────────
 st.set_page_config(page_title="Agente CGSpace – Demo", layout="wide")
 
-st.title("Agente CGSpace – Demo con datos locales de CGSpace")
+st.title("Agente CGSpace – Demo con datos locales y API de CGSpace")
 
 st.write(
     """
 Este demo muestra cómo podría funcionar un **agente** sobre CGSpace:
 
 - A la izquierda escribes una pregunta o tema (chat).
-- El agente busca en un subconjunto local de metadatos de CGSpace (archivo CSV).
+- El agente puede usar:
+  - un **CSV local** con un subconjunto de metadatos (modo estable para demos), o
+  - la **API REST de CGSpace** (modo experimental, en vivo).
 - A la derecha ves métricas, filtros, gráfico y la lista de documentos encontrados.
 
-En producción, este mismo diseño se puede conectar a la **API REST de CGSpace**.
+En producción, se recomienda usar la API con caché y límites de uso acordados con el equipo de CGSpace.
 """
 )
+
+# Selector de fuente de datos
+fuente_datos = st.sidebar.radio(
+    "Fuente de datos",
+    ["CSV local (demo estable)", "API CGSpace (experimental)"],
+    index=0,
+)
+st.sidebar.info(
+    "• CSV local: siempre estable, ideal para demos.\n"
+    "• API CGSpace: consulta el repositorio en vivo (puede fallar si hay límites 429)."
+)
+
+# URL base de la API de CGSpace (DSpace 7)
+CGSPACE_API_URL = "https://cgspace.cgiar.org/server/api/discover/search/objects"
 
 # ─────────────────────────────────────────────
 # Cargar datos locales de CGSpace desde CSV
 # ─────────────────────────────────────────────
 @st.cache_data(show_spinner=True)
-def cargar_datos() -> pd.DataFrame:
+def cargar_datos_locales() -> pd.DataFrame:
     df = pd.read_csv("cgspace_demo.csv")
     # Aseguramos tipos
     if "Año" in df.columns:
@@ -32,19 +49,10 @@ def cargar_datos() -> pd.DataFrame:
     return df
 
 
-df_base = cargar_datos()
+df_base = cargar_datos_locales()
 
 # ─────────────────────────────────────────────
-# Estado de sesión: historial de chat y resultados
-# ─────────────────────────────────────────────
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-
-if "results_df" not in st.session_state:
-    st.session_state.results_df = df_base.copy()
-
-# ─────────────────────────────────────────────
-# Herramienta del agente: búsqueda local
+# Herramienta del agente: búsqueda local (CSV)
 # ─────────────────────────────────────────────
 def buscar_localmente(query: str, df: pd.DataFrame, max_results: int = 200) -> pd.DataFrame:
     """
@@ -83,6 +91,100 @@ def buscar_localmente(query: str, df: pd.DataFrame, max_results: int = 200) -> p
 
 
 # ─────────────────────────────────────────────
+# Herramienta del agente: búsqueda en API de CGSpace
+# ─────────────────────────────────────────────
+@st.cache_data(ttl=600, show_spinner=True)
+def buscar_en_cgspace_api(query: str, page: int = 0, size: int = 50) -> pd.DataFrame:
+    """
+    Llama a la API REST de CGSpace (DSpace 7) usando el endpoint de búsqueda (Discovery).
+    Devuelve un DataFrame con columnas: Título, Año, País (si se encuentra), Enlace, PalabrasClave.
+
+    NOTA: La estructura exacta de metadatos puede variar; algunos campos pueden salir vacíos
+    y requerir ajuste según la configuración de CGSpace.
+    """
+    if not query:
+        return pd.DataFrame()
+
+    params = {
+        "query": query,
+        "page": page,
+        "size": size,
+        "sort": "dcterms.issued,desc",
+    }
+
+    resp = requests.get(CGSPACE_API_URL, params=params, timeout=30)
+    resp.raise_for_status()
+    data = resp.json()
+
+    objects = (
+        data.get("_embedded", {})
+        .get("searchResult", {})
+        .get("_embedded", {})
+        .get("objects", [])
+    )
+
+    filas = []
+    for obj in objects:
+        indexable = obj.get("_embedded", {}).get("indexableObject", {})
+        metadata = indexable.get("metadata", {})
+        handle = indexable.get("handle")
+        enlace = f"https://cgspace.cgiar.org/handle/{handle}" if handle else None
+
+        # Título
+        titulo = None
+        if "dc.title" in metadata:
+            titulo = metadata["dc.title"][0].get("value")
+        elif "dcterms.title" in metadata:
+            titulo = metadata["dcterms.title"][0].get("value")
+        else:
+            titulo = indexable.get("name")
+
+        # Año (intentamos dcterms.issued o dc.date.issued)
+        año = None
+        for key in ["dcterms.issued", "dc.date.issued"]:
+            if key in metadata:
+                v = metadata[key][0].get("value", "")
+                if isinstance(v, str) and len(v) >= 4 and v[:4].isdigit():
+                    año = int(v[:4])
+                    break
+
+        # País (esto depende de cómo CGSpace configure los metadatos)
+        pais = None
+        for key in ["cg.country", "cg.coverage.country", "dc.coverage.spatial"]:
+            if key in metadata:
+                pais = metadata[key][0].get("value")
+                break
+
+        # Palabras clave (temas)
+        palabras = []
+        for key in ["cg.subject", "dc.subject", "dcterms.subject"]:
+            if key in metadata:
+                palabras = [entry.get("value") for entry in metadata[key]]
+                break
+
+        filas.append(
+            {
+                "Título": titulo,
+                "Año": año,
+                "País": pais,
+                "Enlace": enlace,
+                "PalabrasClave": "; ".join(palabras) if palabras else None,
+            }
+        )
+
+    return pd.DataFrame(filas)
+
+
+# ─────────────────────────────────────────────
+# Estado de sesión: historial de chat y resultados
+# ─────────────────────────────────────────────
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+if "results_df" not in st.session_state:
+    st.session_state.results_df = df_base.copy()
+
+# ─────────────────────────────────────────────
 # Layout principal: chat (izquierda) + panel de datos (derecha)
 # ─────────────────────────────────────────────
 col_chat, col_panel = st.columns([1, 2])
@@ -106,59 +208,85 @@ with col_chat:
         with st.chat_message("user"):
             st.markdown(user_input)
 
-        # 1) Búsqueda primaria en los datos locales (tool del agente)
-        df_resultados = buscar_localmente(user_input, df_base, max_results=200)
-
-        # Guardamos sin filtros (después filtramos por país/año en el panel)
-        st.session_state.results_df = df_resultados
-
-        # 2) Construir respuesta de texto del agente
-        if df_resultados.empty:
+        # 1) Llamar a la herramienta adecuada según la fuente de datos
+        try:
+            if fuente_datos == "CSV local (demo estable)":
+                df_resultados = buscar_localmente(user_input, df_base, max_results=200)
+            else:  # API CGSpace
+                df_resultados = buscar_en_cgspace_api(user_input, page=0, size=50)
+        except Exception as e:
+            df_resultados = pd.DataFrame()
             respuesta = (
-                "He buscado en el subconjunto local de CGSpace y **no encontré documentos** "
-                "relacionados con esa consulta.\n\n"
-                "Recuerda que este es solo un subconjunto pequeño de ejemplos. "
-                "En producción, el agente trabajaría sobre todos los registros de CGSpace."
+                "Intenté conectarme a la **API de CGSpace**, pero hubo un error.\n\n"
+                f"Mensaje técnico: `{type(e).__name__}: {e}`\n\n"
+                "Puedes cambiar a *CSV local (demo estable)* en el menú lateral para seguir usando el agente."
             )
+            st.session_state.messages.append({"role": "assistant", "content": respuesta})
+            with st.chat_message("assistant"):
+                st.markdown(respuesta)
         else:
-            n = len(df_resultados)
-            if "Año" in df_resultados.columns:
-                años_min = int(df_resultados["Año"].min())
-                años_max = int(df_resultados["Año"].max())
-                rango_años = f"{años_min}–{años_max}"
+            st.session_state.results_df = df_resultados
+
+            # 2) Construir respuesta de texto del agente
+            if df_resultados.empty:
+                if fuente_datos == "CSV local (demo estable)":
+                    msg_origen = "subconjunto local de CGSpace (CSV de ejemplo)"
+                else:
+                    msg_origen = "API de CGSpace"
+
+                respuesta = (
+                    f"He buscado en el **{msg_origen}** y no encontré documentos "
+                    "relacionados con esa consulta.\n\n"
+                    "Si crees que debería haber resultados, prueba con otras palabras clave "
+                    "o ajusta los filtros de país/año."
+                )
             else:
-                rango_años = "N/D"
+                n = len(df_resultados)
+                if "Año" in df_resultados.columns and df_resultados["Año"].notna().any():
+                    años_min = int(df_resultados["Año"].min())
+                    años_max = int(df_resultados["Año"].max())
+                    rango_años = f"{años_min}–{años_max}"
+                else:
+                    rango_años = "N/D"
 
-            if "País" in df_resultados.columns:
-                paises = ", ".join(df_resultados["País"].dropna().unique().tolist())
-            else:
-                paises = "N/D"
+                if "País" in df_resultados.columns:
+                    paises = ", ".join(
+                        df_resultados["País"].dropna().unique().tolist()
+                    ) or "N/D"
+                else:
+                    paises = "N/D"
 
-            titulos_ejemplo = "- " + "\n- ".join(
-                df_resultados["Título"].head(3).tolist()
-            )
+                titulos_ejemplo = "- " + "\n- ".join(
+                    df_resultados["Título"].dropna().head(3).tolist()
+                )
 
-            respuesta = (
-                f"He encontrado **{n}** documentos en el subconjunto local de CGSpace.\n\n"
-                f"- Rango de años en los resultados: **{rango_años}**\n"
-                f"- Países presentes: **{paises}**\n\n"
-                f"Algunos títulos de ejemplo:\n{titulos_ejemplo}\n\n"
-                "Puedes refinar por año o país en el panel de la derecha."
-            )
+                origen = (
+                    "subconjunto local (CSV)"
+                    if fuente_datos == "CSV local (demo estable)"
+                    else "API de CGSpace"
+                )
 
-        st.session_state.messages.append({"role": "assistant", "content": respuesta})
-        with st.chat_message("assistant"):
-            st.markdown(respuesta)
+                respuesta = (
+                    f"He encontrado **{n}** documentos en la fuente **{origen}**.\n\n"
+                    f"- Rango de años en los resultados: **{rango_años}**\n"
+                    f"- Países presentes: **{paises}**\n\n"
+                    f"Algunos títulos de ejemplo:\n{titulos_ejemplo}\n\n"
+                    "Puedes refinar por año o país en el panel de la derecha."
+                )
+
+            st.session_state.messages.append({"role": "assistant", "content": respuesta})
+            with st.chat_message("assistant"):
+                st.markdown(respuesta)
 
 
 with col_panel:
-    st.subheader("Resultados (subconjunto local de CGSpace)")
+    st.subheader("Resultados")
 
     df_res = st.session_state.results_df
 
     if df_res is None or df_res.empty:
         st.info(
-            "Aquí aparecerán los documentos filtrados del subconjunto local de CGSpace. "
+            "Aquí aparecerán los documentos filtrados.\n\n"
             "Prueba en el chat con temas como **coffee**, **agroecology**, "
             "**climate change**, **Colombia**, etc."
         )
