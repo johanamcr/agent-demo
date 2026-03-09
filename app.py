@@ -711,6 +711,7 @@ def pantalla_resultados():
             "country":                 st.column_config.TextColumn("País", width="small"),
             "agrovoc_subject":         st.column_config.TextColumn("Temas", width="large"),
             "investor_funder_sponsor": st.column_config.TextColumn("Financiador", width="medium"),
+            "handle":                  st.column_config.TextColumn("Link", width="medium"),
         },
     )
 
@@ -781,3 +782,4 @@ if st.session_state.modo == "inicio":
     pantalla_inicio()
 else:
     pantalla_resultados()
+
