@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import requests
+from collections import Counter
 
 # ─────────────────────────────────────────────
 # Configuración de la página
@@ -13,13 +14,13 @@ st.write(
     """
 Este demo muestra cómo podría funcionar un **agente** sobre CGSpace:
 
-- A la izquierda escribes una pregunta o tema (chat).
+- A la izquierda escribes una pregunta o tema.
 - El agente puede usar:
   - un **CSV local** con un subconjunto de metadatos (modo estable para demos), o
   - la **API REST de CGSpace** (modo experimental, en vivo).
-- A la derecha ves métricas, filtros, gráfico y la lista de documentos encontrados.
+- A la derecha ves un **resumen ejecutivo**, métricas, filtros, gráfico y la lista de documentos encontrados.
 
-En producción, se recomienda usar la API con caché y límites de uso acordados con el equipo de CGSpace.
+En producción, este mismo diseño se puede ampliar con resúmenes generativos y lectura de abstracts.
 """
 )
 
@@ -29,21 +30,20 @@ fuente_datos = st.sidebar.radio(
     ["CSV local (demo estable)", "API CGSpace (experimental)"],
     index=0,
 )
+
 st.sidebar.info(
-    "• CSV local: siempre estable, ideal para demos.\n"
+    "• CSV local: estable, ideal para demos.\n"
     "• API CGSpace: consulta el repositorio en vivo (puede fallar si hay límites 429)."
 )
 
-# URL base de la API de CGSpace (DSpace 7)
 CGSPACE_API_URL = "https://cgspace.cgiar.org/server/api/discover/search/objects"
 
 # ─────────────────────────────────────────────
-# Cargar datos locales de CGSpace desde CSV
+# Cargar datos locales
 # ─────────────────────────────────────────────
 @st.cache_data(show_spinner=True)
 def cargar_datos_locales() -> pd.DataFrame:
     df = pd.read_csv("cgspace_demo.csv")
-    # Aseguramos tipos
     if "Año" in df.columns:
         df["Año"] = pd.to_numeric(df["Año"], errors="coerce")
     return df
@@ -52,18 +52,9 @@ def cargar_datos_locales() -> pd.DataFrame:
 df_base = cargar_datos_locales()
 
 # ─────────────────────────────────────────────
-# Herramienta del agente: búsqueda local (CSV)
+# Búsqueda local
 # ─────────────────────────────────────────────
 def buscar_localmente(query: str, df: pd.DataFrame, max_results: int = 200) -> pd.DataFrame:
-    """
-    Busca la query en varias columnas de texto del DataFrame:
-    - Título
-    - País
-    - PalabrasClave
-
-    Es una búsqueda simple (contiene, sin mayúsculas/minúsculas),
-    suficiente para una demo estable.
-    """
     if not query or df.empty:
         return pd.DataFrame()
 
@@ -83,25 +74,16 @@ def buscar_localmente(query: str, df: pd.DataFrame, max_results: int = 200) -> p
 
     resultados = df[mask].copy()
 
-    # Orden por año (más recientes primero) si existe
     if "Año" in resultados.columns:
         resultados = resultados.sort_values("Año", ascending=False)
 
     return resultados.head(max_results)
 
-
 # ─────────────────────────────────────────────
-# Herramienta del agente: búsqueda en API de CGSpace
+# Búsqueda API CGSpace
 # ─────────────────────────────────────────────
 @st.cache_data(ttl=600, show_spinner=True)
 def buscar_en_cgspace_api(query: str, page: int = 0, size: int = 50) -> pd.DataFrame:
-    """
-    Llama a la API REST de CGSpace (DSpace 7) usando el endpoint de búsqueda (Discovery).
-    Devuelve un DataFrame con columnas: Título, Año, País (si se encuentra), Enlace, PalabrasClave.
-
-    NOTA: La estructura exacta de metadatos puede variar; algunos campos pueden salir vacíos
-    y requerir ajuste según la configuración de CGSpace.
-    """
     if not query:
         return pd.DataFrame()
 
@@ -130,7 +112,6 @@ def buscar_en_cgspace_api(query: str, page: int = 0, size: int = 50) -> pd.DataF
         handle = indexable.get("handle")
         enlace = f"https://cgspace.cgiar.org/handle/{handle}" if handle else None
 
-        # Título
         titulo = None
         if "dc.title" in metadata:
             titulo = metadata["dc.title"][0].get("value")
@@ -139,7 +120,6 @@ def buscar_en_cgspace_api(query: str, page: int = 0, size: int = 50) -> pd.DataF
         else:
             titulo = indexable.get("name")
 
-        # Año (intentamos dcterms.issued o dc.date.issued)
         año = None
         for key in ["dcterms.issued", "dc.date.issued"]:
             if key in metadata:
@@ -148,14 +128,12 @@ def buscar_en_cgspace_api(query: str, page: int = 0, size: int = 50) -> pd.DataF
                     año = int(v[:4])
                     break
 
-        # País (esto depende de cómo CGSpace configure los metadatos)
         pais = None
         for key in ["cg.country", "cg.coverage.country", "dc.coverage.spatial"]:
             if key in metadata:
                 pais = metadata[key][0].get("value")
                 break
 
-        # Palabras clave (temas)
         palabras = []
         for key in ["cg.subject", "dc.subject", "dcterms.subject"]:
             if key in metadata:
@@ -174,9 +152,71 @@ def buscar_en_cgspace_api(query: str, page: int = 0, size: int = 50) -> pd.DataF
 
     return pd.DataFrame(filas)
 
+# ─────────────────────────────────────────────
+# Resumen automático
+# ─────────────────────────────────────────────
+def extraer_temas_frecuentes(df: pd.DataFrame, top_n: int = 5):
+    if "PalabrasClave" not in df.columns or df.empty:
+        return []
+
+    temas = []
+    for val in df["PalabrasClave"].dropna():
+        partes = [x.strip() for x in str(val).split(";") if x.strip()]
+        temas.extend(partes)
+
+    if not temas:
+        return []
+
+    conteo = Counter(temas)
+    return [tema for tema, _ in conteo.most_common(top_n)]
+
+
+def generar_resumen_ejecutivo(df: pd.DataFrame, query: str, fuente: str) -> str:
+    if df.empty:
+        return (
+            f"No se encontraron documentos para la consulta **{query}** "
+            f"en la fuente **{fuente}**."
+        )
+
+    n = len(df)
+
+    # años
+    if "Año" in df.columns and df["Año"].notna().any():
+        año_min = int(df["Año"].min())
+        año_max = int(df["Año"].max())
+        texto_años = f"entre **{año_min}** y **{año_max}**"
+    else:
+        texto_años = "sin rango temporal identificado"
+
+    # países
+    if "País" in df.columns:
+        paises = df["País"].dropna().unique().tolist()
+        num_paises = len(paises)
+        paises_txt = ", ".join(paises[:5]) if paises else "sin países identificados"
+    else:
+        num_paises = 0
+        paises_txt = "sin países identificados"
+
+    # temas
+    temas = extraer_temas_frecuentes(df, top_n=5)
+    temas_txt = ", ".join(temas) if temas else "sin palabras clave disponibles"
+
+    # títulos ejemplo
+    titulos = df["Título"].dropna().head(3).tolist() if "Título" in df.columns else []
+    titulos_txt = "; ".join(titulos) if titulos else "sin títulos destacados"
+
+    resumen = (
+        f"Para la consulta **{query}**, el agente identificó **{n} documentos** "
+        f"en la fuente **{fuente}**, con registros publicados {texto_años}. "
+        f"Los resultados abarcan **{num_paises} países** y muestran presencia de temas como "
+        f"**{temas_txt}**. Entre los documentos destacados se encuentran: {titulos_txt}. "
+        f"Los países más visibles en esta consulta son: {paises_txt}."
+    )
+
+    return resumen
 
 # ─────────────────────────────────────────────
-# Estado de sesión: historial de chat y resultados
+# Estado de sesión
 # ─────────────────────────────────────────────
 if "messages" not in st.session_state:
     st.session_state.messages = []
@@ -184,105 +224,84 @@ if "messages" not in st.session_state:
 if "results_df" not in st.session_state:
     st.session_state.results_df = df_base.copy()
 
+if "last_query" not in st.session_state:
+    st.session_state.last_query = "consulta inicial"
+
+if "summary_text" not in st.session_state:
+    st.session_state.summary_text = "Aquí aparecerá el resumen ejecutivo de la consulta."
+
 # ─────────────────────────────────────────────
-# Layout principal: chat (izquierda) + panel de datos (derecha)
+# Layout principal
 # ─────────────────────────────────────────────
 col_chat, col_panel = st.columns([1, 2])
 
 with col_chat:
-    st.subheader("Chat con el agente CGSpace (demo)")
+    st.subheader("Chat con el agente CGSpace")
 
-    # Mostrar historial
     for msg in st.session_state.messages:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
 
-    # Entrada del usuario
     user_input = st.chat_input(
         "Escribe un tema o pregunta (ej. coffee rust, agroecology, climate change Africa, Colombia)..."
     )
 
     if user_input:
-        # Guardar mensaje de usuario
         st.session_state.messages.append({"role": "user", "content": user_input})
         with st.chat_message("user"):
             st.markdown(user_input)
 
-        # 1) Llamar a la herramienta adecuada según la fuente de datos
         try:
             if fuente_datos == "CSV local (demo estable)":
                 df_resultados = buscar_localmente(user_input, df_base, max_results=200)
-            else:  # API CGSpace
+                origen = "subconjunto local (CSV)"
+            else:
                 df_resultados = buscar_en_cgspace_api(user_input, page=0, size=50)
+                origen = "API de CGSpace"
         except Exception as e:
             df_resultados = pd.DataFrame()
             respuesta = (
-                "Intenté conectarme a la **API de CGSpace**, pero hubo un error.\n\n"
+                "Intenté conectarme a la fuente de datos, pero hubo un error.\n\n"
                 f"Mensaje técnico: `{type(e).__name__}: {e}`\n\n"
-                "Puedes cambiar a *CSV local (demo estable)* en el menú lateral para seguir usando el agente."
+                "Puedes cambiar de fuente en el menú lateral."
             )
             st.session_state.messages.append({"role": "assistant", "content": respuesta})
+            st.session_state.results_df = pd.DataFrame()
+            st.session_state.last_query = user_input
+            st.session_state.summary_text = "No fue posible generar resumen por error en la consulta."
             with st.chat_message("assistant"):
                 st.markdown(respuesta)
         else:
             st.session_state.results_df = df_resultados
+            st.session_state.last_query = user_input
+            st.session_state.summary_text = generar_resumen_ejecutivo(
+                df_resultados, user_input, origen
+            )
 
-            # 2) Construir respuesta de texto del agente
             if df_resultados.empty:
-                if fuente_datos == "CSV local (demo estable)":
-                    msg_origen = "subconjunto local de CGSpace (CSV de ejemplo)"
-                else:
-                    msg_origen = "API de CGSpace"
-
                 respuesta = (
-                    f"He buscado en el **{msg_origen}** y no encontré documentos "
+                    f"He buscado en la fuente **{origen}** y no encontré documentos "
                     "relacionados con esa consulta.\n\n"
-                    "Si crees que debería haber resultados, prueba con otras palabras clave "
-                    "o ajusta los filtros de país/año."
+                    "Prueba con otras palabras clave o cambia la fuente de datos."
                 )
             else:
-                n = len(df_resultados)
-                if "Año" in df_resultados.columns and df_resultados["Año"].notna().any():
-                    años_min = int(df_resultados["Año"].min())
-                    años_max = int(df_resultados["Año"].max())
-                    rango_años = f"{años_min}–{años_max}"
-                else:
-                    rango_años = "N/D"
-
-                if "País" in df_resultados.columns:
-                    paises = ", ".join(
-                        df_resultados["País"].dropna().unique().tolist()
-                    ) or "N/D"
-                else:
-                    paises = "N/D"
-
-                titulos_ejemplo = "- " + "\n- ".join(
-                    df_resultados["Título"].dropna().head(3).tolist()
-                )
-
-                origen = (
-                    "subconjunto local (CSV)"
-                    if fuente_datos == "CSV local (demo estable)"
-                    else "API de CGSpace"
-                )
-
                 respuesta = (
-                    f"He encontrado **{n}** documentos en la fuente **{origen}**.\n\n"
-                    f"- Rango de años en los resultados: **{rango_años}**\n"
-                    f"- Países presentes: **{paises}**\n\n"
-                    f"Algunos títulos de ejemplo:\n{titulos_ejemplo}\n\n"
-                    "Puedes refinar por año o país en el panel de la derecha."
+                    f"He encontrado **{len(df_resultados)}** documentos en la fuente **{origen}**.\n\n"
+                    "En el panel derecho puedes ver un **resumen ejecutivo**, métricas, filtros y la lista de resultados."
                 )
 
             st.session_state.messages.append({"role": "assistant", "content": respuesta})
             with st.chat_message("assistant"):
                 st.markdown(respuesta)
 
-
 with col_panel:
-    st.subheader("Resultados")
+    st.subheader("Resultados y síntesis")
 
     df_res = st.session_state.results_df
+
+    # ── Resumen ejecutivo ───────────────────────────
+    st.markdown("### Resumen ejecutivo")
+    st.info(st.session_state.summary_text)
 
     if df_res is None or df_res.empty:
         st.info(
@@ -291,11 +310,16 @@ with col_panel:
             "**climate change**, **Colombia**, etc."
         )
     else:
-        # ── Filtros interactivos ───────────────────────────
+        # ── Temas detectados ───────────────────────────
+        temas_detectados = extraer_temas_frecuentes(df_res, top_n=5)
+        if temas_detectados:
+            st.markdown("### Temas detectados")
+            st.write(", ".join(temas_detectados))
+
+        # ── Filtros ───────────────────────────
         with st.expander("Filtros (año, país)", expanded=True):
             col_f1, col_f2 = st.columns(2)
 
-            # Filtro por rango de años
             if "Año" in df_res.columns and df_res["Año"].notna().any():
                 años_validos = sorted(df_res["Año"].dropna().unique().tolist())
 
@@ -314,13 +338,11 @@ with col_panel:
                         & (df_res["Año"] <= year_range[1])
                     ]
                 else:
-                    # Solo hay un año en los resultados → no usamos slider
                     unico = int(años_validos[0])
                     col_f1.write(f"Todos los resultados son del año **{unico}**.")
             else:
                 col_f1.write("No hay información de año en los resultados.")
 
-            # Filtro por país
             if "País" in df_res.columns:
                 paises_unicos = sorted(df_res["País"].dropna().unique().tolist())
                 if paises_unicos:
@@ -339,29 +361,23 @@ with col_panel:
 
         col_m1.metric("Documentos encontrados", len(df_res))
 
-        if "Año" in df_res.columns and not df_res.empty:
-            col_m2.metric(
-                "Año más reciente",
-                int(df_res["Año"].max()),
-            )
+        if "Año" in df_res.columns and not df_res.empty and df_res["Año"].notna().any():
+            col_m2.metric("Año más reciente", int(df_res["Año"].max()))
         else:
             col_m2.metric("Año más reciente", "N/D")
 
         if "País" in df_res.columns and not df_res.empty:
-            col_m3.metric(
-                "Nº de países en resultados",
-                df_res["País"].nunique(),
-            )
+            col_m3.metric("Nº de países en resultados", df_res["País"].nunique())
         else:
             col_m3.metric("Nº de países en resultados", "N/D")
 
-        # ── Gráfico simple: nº de docs por año ───────────────────────────
-        if "Año" in df_res.columns and not df_res.empty:
+        # ── Gráfico ───────────────────────────
+        if "Año" in df_res.columns and not df_res.empty and df_res["Año"].notna().any():
             st.markdown("### Documentos por año")
             docs_por_anio = df_res.groupby("Año").size().reset_index(name="Documentos")
             docs_por_anio = docs_por_anio.sort_values("Año")
             st.bar_chart(docs_por_anio.set_index("Año"))
 
-        # ── Tabla de resultados ───────────────────────────
+        # ── Tabla ───────────────────────────
         st.markdown("### Lista de documentos")
         st.dataframe(df_res, use_container_width=True)
