@@ -387,7 +387,7 @@ with st.sidebar:
     st.markdown("### 1 · Fuente de datos")
     fuente = st.radio(
         "fuente",
-        ["📂  Base local (175k docs)", "🌐  API CGSpace (en vivo)"],
+        ["📂  Base local", "🌐  API CGSpace (en vivo)"],
         label_visibility="collapsed",
         help="La base local es más completa y rápida. La API trae documentos en tiempo real.",
     )
@@ -694,7 +694,7 @@ def pantalla_resultados():
     st.markdown(f"### 📄 Documentos ({total:,})")
 
     cols_tabla = [c for c in ["title", "year", "type", "country",
-                               "agrovoc_subject", "investor_funder_sponsor"]
+                               "agrovoc_subject", "investor_funder_sponsor", "handle"]
                   if c in df.columns]
 
     evento = st.dataframe(
@@ -711,7 +711,7 @@ def pantalla_resultados():
             "country":                 st.column_config.TextColumn("País", width="small"),
             "agrovoc_subject":         st.column_config.TextColumn("Temas", width="large"),
             "investor_funder_sponsor": st.column_config.TextColumn("Financiador", width="medium"),
-            "handle":                  st.column_config.TextColumn("Link", width="medium"),
+            "handle":                  st.column_config.LinkColumn("Enlace", width="small", display_text="🔗 Ver"),
         },
     )
 
@@ -782,4 +782,3 @@ if st.session_state.modo == "inicio":
     pantalla_inicio()
 else:
     pantalla_resultados()
-
