@@ -1,12 +1,12 @@
 """
-CGSpace Explorer – versión mejorada
-====================================
-Mejoras principales:
-  - Una sola fuente de verdad: KPIs, gráficos y tabla muestran exactamente los mismos documentos.
-  - Búsqueda enriquecida: sinónimos automáticos + búsqueda en múltiples campos del API.
-  - Filtros inteligentes post-búsqueda: región/país, año, tipo de documento.
-  - Visualizaciones: mapa de países (plotly), timeline, nube de temas, tabla descargable.
-  - Lenguaje limpio para donantes: sin referencias a "agente".
+CGSpace Explorer
+================
+Dos fuentes de búsqueda independientes:
+  1. CSV local  – 175k documentos, búsqueda instantánea en título/autor/agrovoc/país/funder
+  2. API CGSpace – consulta en vivo con expansión de términos y filtro de relevancia
+
+Una sola fuente de verdad por tab: KPIs, gráficos y tabla siempre reflejan
+exactamente los mismos documentos filtrados.
 """
 
 import streamlit as st
@@ -14,146 +14,244 @@ import pandas as pd
 import requests
 from collections import Counter
 import plotly.express as px
+import pyreadr
 
-# ──────────────────────────────────────────────
-# Configuración general
-# ──────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
+# Configuración de página
+# ─────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="CGSpace Explorer",
+    page_icon="🌱",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-# CSS mínimo para pulir la UI
-st.markdown(
-    """
-    <style>
-    .block-container { padding-top: 1.5rem; padding-bottom: 2rem; }
-    .stMetric label { font-size: 0.78rem; color: #6b7280; }
-    .stMetric [data-testid="stMetricValue"] { font-size: 1.6rem; font-weight: 700; }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+st.markdown("""
+<style>
+.block-container { padding-top: 1.2rem; padding-bottom: 2rem; }
+.stMetric label { font-size: 0.75rem; color: #6b7280; text-transform: uppercase; letter-spacing: .04em; }
+.stMetric [data-testid="stMetricValue"] { font-size: 1.7rem; font-weight: 700; color: #15803d; }
+</style>
+""", unsafe_allow_html=True)
 
-# ──────────────────────────────────────────────
-# Sinónimos / expansión de consulta
-# ──────────────────────────────────────────────
-SINONIMOS: dict[str, list[str]] = {
-    # Español → inglés (CGSpace indexa en inglés)
-    "agroecología": ["agroecology", "sustainable farming", "organic farming", "ecological agriculture"],
-    "agroecologia": ["agroecology", "sustainable farming", "organic farming"],
-    "café": ["coffee", "coffea"],
-    "cafe": ["coffee", "coffea"],
-    "roya": ["coffee rust", "leaf rust", "hemileia vastatrix"],
-    "cambio climático": ["climate change", "global warming", "climate variability"],
-    "cambio climatico": ["climate change", "global warming", "climate variability"],
-    "sequía": ["drought", "water stress", "dry season"],
-    "sequia": ["drought", "water stress"],
-    "biodiversidad": ["biodiversity", "species diversity", "genetic resources"],
-    "seguridad alimentaria": ["food security", "food systems", "nutrition"],
-    "género": ["gender", "women", "female farmers"],
-    "genero": ["gender", "women", "female farmers"],
-    "maíz": ["maize", "corn", "zea mays"],
-    "maiz": ["maize", "corn", "zea mays"],
-    "arroz": ["rice", "oryza"],
-    "trigo": ["wheat", "triticum"],
-    "frijol": ["bean", "phaseolus", "legume"],
-    "frijoles": ["bean", "phaseolus", "legume"],
-    "suelo": ["soil", "soil health", "land degradation"],
-    "agua": ["water", "irrigation", "watershed"],
-    "ganadería": ["livestock", "cattle", "animal husbandry"],
-    "ganaderia": ["livestock", "cattle", "animal husbandry"],
-    "fertilizante": ["fertilizer", "nutrient management", "soil fertility"],
-    "plagas": ["pest", "pest management", "integrated pest management"],
-    "semillas": ["seeds", "seed systems", "plant breeding"],
-    "variedades": ["varieties", "cultivars", "crop improvement"],
-    "bosque": ["forest", "deforestation", "agroforestry"],
-    "Colombia": ["Colombia"],
-    "Africa": ["Africa", "Sub-Saharan Africa", "East Africa", "West Africa"],
-    "África": ["Africa", "Sub-Saharan Africa", "East Africa", "West Africa"],
-    "Asia": ["Asia", "South Asia", "Southeast Asia"],
-    "smallholder": ["smallholder", "small-scale farmer", "family farm"],
-}
-
+# ─────────────────────────────────────────────────────────────
+# Constantes
+# ─────────────────────────────────────────────────────────────
+RDS_PATH    = "base_cgspace_completa.rds"  # archivo RDS exportado desde R
 CGSPACE_API = "https://cgspace.cgiar.org/server/api/discover/search/objects"
+
+# Campos del CSV en los que se hace la búsqueda de texto
+CSV_SEARCH_FIELDS = [
+    "title", "author", "agrovoc_subject",
+    "country", "investor_funder_sponsor", "repository_collection",
+]
+
+# ─────────────────────────────────────────────────────────────
+# Diccionario de sinónimos ES → EN
+# ─────────────────────────────────────────────────────────────
+SINONIMOS: dict[str, list[str]] = {
+    "agroecología":          ["agroecology", "sustainable farming", "organic farming"],
+    "agroecologia":          ["agroecology", "sustainable farming", "organic farming"],
+    "café":                  ["coffee", "coffea"],
+    "cafe":                  ["coffee", "coffea"],
+    "roya":                  ["coffee rust", "leaf rust", "hemileia vastatrix"],
+    "cambio climático":      ["climate change", "global warming", "climate variability"],
+    "cambio climatico":      ["climate change", "global warming", "climate variability"],
+    "sequía":                ["drought", "water stress"],
+    "sequia":                ["drought", "water stress"],
+    "biodiversidad":         ["biodiversity", "species diversity", "genetic resources"],
+    "seguridad alimentaria": ["food security", "food systems", "nutrition"],
+    "género":                ["gender", "women", "female farmers"],
+    "genero":                ["gender", "women", "female farmers"],
+    "maíz":                  ["maize", "corn", "zea mays"],
+    "maiz":                  ["maize", "corn", "zea mays"],
+    "arroz":                 ["rice", "oryza"],
+    "trigo":                 ["wheat", "triticum"],
+    "frijol":                ["bean", "phaseolus", "legume"],
+    "suelo":                 ["soil", "soil health", "land degradation"],
+    "agua":                  ["water", "irrigation", "watershed"],
+    "ganadería":             ["livestock", "cattle", "animal husbandry"],
+    "ganaderia":             ["livestock", "cattle", "animal husbandry"],
+    "fertilizante":          ["fertilizer", "nutrient management"],
+    "plagas":                ["pest", "pest management", "ipm"],
+    "semillas":              ["seeds", "seed systems", "plant breeding"],
+    "variedades":            ["varieties", "cultivars", "crop improvement"],
+    "bosque":                ["forest", "deforestation", "agroforestry"],
+    "áfrica":                ["africa", "sub-saharan africa", "east africa", "west africa"],
+    "africa":                ["africa", "sub-saharan africa", "east africa", "west africa"],
+    "asia":                  ["asia", "south asia", "southeast asia"],
+    "latinoamérica":         ["latin america", "south america", "central america"],
+    "latinoamerica":         ["latin america", "south america", "central america"],
+    "smallholder":           ["smallholder", "small-scale farmer", "family farm"],
+    "nutrición":             ["nutrition", "malnutrition", "dietary"],
+    "nutricion":             ["nutrition", "malnutrition", "dietary"],
+}
 
 
 def expandir_consulta(query: str) -> list[str]:
-    """
-    Devuelve lista de términos de búsqueda: la consulta original + sinónimos encontrados.
-    """
+    """Devuelve la consulta original + sinónimos, sin duplicados."""
+    q = query.strip().lower()
     terminos = [query.strip()]
-    q_lower = query.lower().strip()
 
-    # Coincidencias exactas
-    if q_lower in SINONIMOS:
-        terminos.extend(SINONIMOS[q_lower])
+    if q in SINONIMOS:
+        terminos.extend(SINONIMOS[q])
 
-    # Coincidencias parciales (la consulta contiene la clave)
     for clave, sinonimos in SINONIMOS.items():
-        if clave in q_lower and clave != q_lower:
+        if clave in q and clave != q:
             terminos.extend(sinonimos)
 
-    # Eliminar duplicados manteniendo orden
-    vistos = set()
-    unicos = []
+    vistos, unicos = set(), []
     for t in terminos:
         if t.lower() not in vistos:
             vistos.add(t.lower())
             unicos.append(t)
-
     return unicos
 
 
-# ──────────────────────────────────────────────
-# Carga CSV local
-# ──────────────────────────────────────────────
-@st.cache_data(show_spinner=False)
-def cargar_csv() -> pd.DataFrame:
+# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
+# Carga del RDS (cacheada — solo se lee una vez)
+# ─────────────────────────────────────────────────────────────
+@st.cache_data(show_spinner="Cargando base de datos local…")
+def cargar_datos() -> pd.DataFrame:
+    """
+    Lee el archivo RDS exportado desde R con pyreadr.
+    pyreadr.read_r() devuelve un dict; el df está bajo la clave None.
+    """
     try:
-        df = pd.read_csv("cgspace_demo.csv")
-        if "Año" in df.columns:
-            df["Año"] = pd.to_numeric(df["Año"], errors="coerce")
-        return df
+        resultado = pyreadr.read_r(RDS_PATH)
+        df = resultado[None] if None in resultado else list(resultado.values())[0]
+        if "year" in df.columns:
+            df["year"] = pd.to_numeric(df["year"], errors="coerce")
+        if "handle" in df.columns:
+            def normalizar_handle(h):
+                if pd.isna(h): return None
+                h = str(h).strip()
+                return h if h.startswith("http") else f"https://cgspace.cgiar.org/handle/{h}"
+            df["handle"] = df["handle"].apply(normalizar_handle)
+        return df.reset_index(drop=True)
     except FileNotFoundError:
+        st.error(f"Archivo no encontrado: `{RDS_PATH}`. Colócalo junto a cgspace_app.py")
+        return pd.DataFrame()
+    except Exception as e:
+        st.error(f"Error al leer el RDS: {e}")
         return pd.DataFrame()
 
+df_csv_global = cargar_datos()
 
-df_csv = cargar_csv()
 
-
-# ──────────────────────────────────────────────
-# Búsqueda local (CSV) – búsqueda expandida
-# ──────────────────────────────────────────────
-def buscar_local(terminos: list[str], df: pd.DataFrame, max_results: int = 300) -> pd.DataFrame:
+# ─────────────────────────────────────────────────────────────
+# BÚSQUEDA EN CSV
+# ─────────────────────────────────────────────────────────────
+def buscar_csv(terminos: list[str], max_results: int = 500) -> pd.DataFrame:
+    """
+    Un documento aparece si AL MENOS UN término está presente
+    en cualquiera de los campos de CSV_SEARCH_FIELDS.
+    """
+    df = df_csv_global
     if df.empty or not terminos:
         return pd.DataFrame()
 
-    cols = [c for c in ["Título", "País", "PalabrasClave", "Resumen", "Autores"] if c in df.columns]
-    if not cols:
+    campos = [c for c in CSV_SEARCH_FIELDS if c in df.columns]
+    if not campos:
         return pd.DataFrame()
 
-    mask = pd.Series([False] * len(df), index=df.index)
+    mask = pd.Series(False, index=df.index)
     for termino in terminos:
         t = termino.lower()
-        for col in cols:
-            mask |= df[col].astype(str).str.lower().str.contains(t, na=False)
+        for col in campos:
+            mask |= df[col].astype(str).str.lower().str.contains(t, na=False, regex=False)
 
     resultado = df[mask].copy()
-    if "Año" in resultado.columns:
-        resultado = resultado.sort_values("Año", ascending=False)
-    return resultado.head(max_results)
+    if "year" in resultado.columns:
+        resultado = resultado.sort_values("year", ascending=False)
+
+    return resultado.head(max_results).reset_index(drop=True)
 
 
-# ──────────────────────────────────────────────
-# Búsqueda API CGSpace – búsqueda expandida
-# ──────────────────────────────────────────────
-@st.cache_data(ttl=600, show_spinner=False)
-def buscar_api(terminos: list[str], size: int = 100) -> pd.DataFrame:
+# ─────────────────────────────────────────────────────────────
+# BÚSQUEDA EN API CGSPACE
+# ─────────────────────────────────────────────────────────────
+def _parsear_item_api(indexable: dict) -> dict | None:
+    metadata = indexable.get("metadata", {})
+    handle   = indexable.get("handle")
+    enlace   = f"https://cgspace.cgiar.org/handle/{handle}" if handle else None
+
+    # Título
+    titulo = None
+    for key in ["dc.title", "dcterms.title"]:
+        if key in metadata:
+            titulo = metadata[key][0].get("value")
+            break
+    if not titulo:
+        titulo = indexable.get("name")
+    if not titulo:
+        return None
+
+    # Año (solo 1970-2025)
+    year = None
+    for key in ["dcterms.issued", "dc.date.issued"]:
+        if key in metadata:
+            for entry in metadata[key]:
+                v = str(entry.get("value", ""))
+                if len(v) >= 4 and v[:4].isdigit():
+                    c = int(v[:4])
+                    if 1970 <= c <= 2025:
+                        year = c
+                        break
+        if year:
+            break
+
+    # País
+    pais = None
+    for key in ["cg.country", "cg.coverage.country", "dc.coverage.spatial"]:
+        if key in metadata:
+            vals = [e.get("value", "") for e in metadata[key] if e.get("value")]
+            if vals:
+                pais = vals[0]
+                break
+
+    # Temas
+    temas = []
+    for key in ["cg.subject.cgiar", "cg.subject", "dc.subject", "dcterms.subject"]:
+        if key in metadata:
+            temas = [e.get("value", "") for e in metadata[key] if e.get("value")]
+            if temas:
+                break
+
+    # Tipo
+    tipo = None
+    for key in ["dc.type", "dcterms.type"]:
+        if key in metadata:
+            tipo = metadata[key][0].get("value")
+            break
+
+    # Financiador
+    funder = None
+    for key in ["cg.contributor.funder", "dc.contributor.funder"]:
+        if key in metadata:
+            vals = [e.get("value", "") for e in metadata[key] if e.get("value")]
+            if vals:
+                funder = "; ".join(vals[:3])
+                break
+
+    return {
+        "title":                   titulo,
+        "year":                    year,
+        "type":                    tipo,
+        "country":                 pais,
+        "agrovoc_subject":         ", ".join(temas) if temas else None,
+        "investor_funder_sponsor": funder,
+        "handle":                  enlace,
+        "_texto":                  (titulo + " " + " ".join(temas)).lower(),
+    }
+
+
+@st.cache_data(ttl=600, show_spinner="Consultando CGSpace API…")
+def buscar_api(terminos: list[str], pages_per_term: int = 2, size: int = 50) -> pd.DataFrame:
     """
-    Lanza hasta 3 búsquedas con los términos más relevantes y une resultados.
-    Cada llamada busca en múltiples campos: título, abstract, subjects, country.
+    Sin sort por fecha → distribución real de años.
+    Filtra post-fetch para garantizar relevancia real.
     """
     if not terminos:
         return pd.DataFrame()
@@ -161,515 +259,414 @@ def buscar_api(terminos: list[str], size: int = 100) -> pd.DataFrame:
     todos: list[dict] = []
     handles_vistos: set[str] = set()
 
-    # Buscar los 3 primeros términos (original + top sinónimos)
     for termino in terminos[:3]:
-        params = {
-            "query": termino,
-            "page": 0,
-            "size": size,
-            "sort": "dcterms.issued,desc",
-            # DSpace 7 permite scope=* para buscar en todos los campos
-            "searchFilter": "scope=*",
-        }
-        try:
-            resp = requests.get(CGSPACE_API, params=params, timeout=30)
-            resp.raise_for_status()
-            data = resp.json()
-
-            objects = (
-                data.get("_embedded", {})
-                .get("searchResult", {})
-                .get("_embedded", {})
-                .get("objects", [])
-            )
-
-            for obj in objects:
-                indexable = obj.get("_embedded", {}).get("indexableObject", {})
-                handle = indexable.get("handle")
-                if handle in handles_vistos:
-                    continue
-                handles_vistos.add(handle)
-
-                metadata = indexable.get("metadata", {})
-                enlace = f"https://cgspace.cgiar.org/handle/{handle}" if handle else None
-
-                # Título
-                titulo = None
-                for key in ["dc.title", "dcterms.title"]:
-                    if key in metadata:
-                        titulo = metadata[key][0].get("value")
-                        break
-                if not titulo:
-                    titulo = indexable.get("name")
-
-                # Año
-                año = None
-                for key in ["dcterms.issued", "dc.date.issued"]:
-                    if key in metadata:
-                        v = metadata[key][0].get("value", "")
-                        if isinstance(v, str) and len(v) >= 4 and v[:4].isdigit():
-                            año = int(v[:4])
-                            break
-
-                # País
-                pais = None
-                for key in ["cg.country", "cg.coverage.country", "dc.coverage.spatial"]:
-                    if key in metadata:
-                        pais = metadata[key][0].get("value")
-                        break
-
-                # Palabras clave
-                palabras = []
-                for key in ["cg.subject", "dc.subject", "dcterms.subject"]:
-                    if key in metadata:
-                        palabras = [e.get("value", "") for e in metadata[key]]
-                        break
-
-                # Abstract
-                abstract = None
-                for key in ["dc.description.abstract", "dcterms.abstract"]:
-                    if key in metadata:
-                        abstract = metadata[key][0].get("value")
-                        break
-
-                # Tipo de documento
-                tipo = None
-                for key in ["dc.type", "dcterms.type"]:
-                    if key in metadata:
-                        tipo = metadata[key][0].get("value")
-                        break
-
-                # Autores
-                autores = []
-                for key in ["dc.contributor.author", "dcterms.creator"]:
-                    if key in metadata:
-                        autores = [e.get("value", "") for e in metadata[key]]
-                        break
-
-                todos.append({
-                    "Título": titulo,
-                    "Año": año,
-                    "País": pais,
-                    "Tipo": tipo,
-                    "PalabrasClave": "; ".join(palabras) if palabras else None,
-                    "Autores": "; ".join(autores[:3]) if autores else None,
-                    "Abstract": abstract[:300] + "..." if abstract and len(abstract) > 300 else abstract,
-                    "Enlace": enlace,
-                })
-
-        except Exception:
-            continue  # Si una sub-búsqueda falla, continuar con la siguiente
+        for page in range(pages_per_term):
+            try:
+                resp = requests.get(
+                    CGSPACE_API,
+                    params={"query": termino, "page": page, "size": size},
+                    timeout=30,
+                )
+                resp.raise_for_status()
+                objects = (
+                    resp.json()
+                    .get("_embedded", {})
+                    .get("searchResult", {})
+                    .get("_embedded", {})
+                    .get("objects", [])
+                )
+                if not objects:
+                    break
+                for obj in objects:
+                    indexable = obj.get("_embedded", {}).get("indexableObject", {})
+                    handle    = indexable.get("handle")
+                    if not handle or handle in handles_vistos:
+                        continue
+                    handles_vistos.add(handle)
+                    parsed = _parsear_item_api(indexable)
+                    if parsed:
+                        todos.append(parsed)
+            except Exception:
+                break
 
     if not todos:
         return pd.DataFrame()
 
     df = pd.DataFrame(todos)
-    if "Año" in df.columns:
-        df["Año"] = pd.to_numeric(df["Año"], errors="coerce")
-        df = df.sort_values("Año", ascending=False)
+
+    # Filtro de relevancia: al menos un término en título o temas
+    def es_relevante(row):
+        texto = row.get("_texto", "")
+        return any(t.lower() in texto for t in terminos) if texto else True
+
+    df = df[df.apply(es_relevante, axis=1)].drop(columns=["_texto"], errors="ignore")
+
+    if "year" in df.columns:
+        df["year"] = pd.to_numeric(df["year"], errors="coerce")
+        df = df.sort_values("year", ascending=False)
 
     return df.reset_index(drop=True)
 
 
-# ──────────────────────────────────────────────
-# Función principal de búsqueda
-# ──────────────────────────────────────────────
-def ejecutar_busqueda(query: str, fuente: str) -> tuple[pd.DataFrame, list[str]]:
-    """
-    Retorna (df_resultados, terminos_usados).
-    df_resultados es la única fuente de verdad para todos los componentes.
-    """
-    query = query.strip()
-    if not query:
-        return pd.DataFrame(), []
-
-    terminos = expandir_consulta(query)
-
-    if fuente == "CSV local":
-        if df_csv.empty:
-            return pd.DataFrame(), terminos
-        df = buscar_local(terminos, df_csv)
-    else:  # API + CSV como respaldo
-        df = buscar_api(terminos)
-        if df.empty and not df_csv.empty:
-            df = buscar_local(terminos, df_csv)
-
-    return df, terminos
-
-
-# ──────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
 # Funciones de análisis
-# ──────────────────────────────────────────────
-def temas_frecuentes(df: pd.DataFrame, top_n: int = 20) -> list[tuple[str, int]]:
-    if "PalabrasClave" not in df.columns or df.empty:
+# ─────────────────────────────────────────────────────────────
+def extraer_temas(df: pd.DataFrame, top_n: int = 15) -> list[tuple[str, int]]:
+    col = "agrovoc_subject"
+    if col not in df.columns or df.empty:
         return []
     temas = []
-    for val in df["PalabrasClave"].dropna():
-        temas.extend([x.strip() for x in str(val).split(";") if x.strip()])
+    for val in df[col].dropna():
+        temas.extend([t.strip() for t in str(val).split(",") if t.strip()])
     return Counter(temas).most_common(top_n)
 
 
-# ──────────────────────────────────────────────
+def aplicar_filtros(df, year_range, paises_sel, tipos_sel) -> pd.DataFrame:
+    out = df.copy()
+    if year_range and "year" in out.columns and out["year"].notna().any():
+        out = out[out["year"].between(year_range[0], year_range[1])]
+    if paises_sel and "country" in out.columns:
+        out = out[out["country"].isin(paises_sel)]
+    if tipos_sel and "type" in out.columns:
+        out = out[out["type"].isin(tipos_sel)]
+    return out
+
+
+# ─────────────────────────────────────────────────────────────
 # Estado de sesión
-# ──────────────────────────────────────────────
-for key, default in [
-    ("df_results", pd.DataFrame()),
-    ("last_query", ""),
-    ("terminos_usados", []),
-    ("fuente_usada", ""),
-    ("chat_history", []),
-]:
-    if key not in st.session_state:
-        st.session_state[key] = default
+# ─────────────────────────────────────────────────────────────
+for k, v in {
+    "df_csv_results": pd.DataFrame(),
+    "df_api_results": pd.DataFrame(),
+    "last_query":     "",
+    "terminos":       [],
+    "chat_history":   [],
+}.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
 
 
-# ──────────────────────────────────────────────
-# Sidebar
-# ──────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
+# SIDEBAR
+# ─────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.markdown("## 🔍 CGSpace Explorer")
+    st.markdown("## 🌱 CGSpace Explorer")
     st.markdown("---")
+    st.markdown("### Búsqueda")
 
-    fuente = st.radio(
-        "Fuente de datos",
-        ["API CGSpace + CSV respaldo", "CSV local"],
-        index=0,
-        help="API CGSpace consulta el repositorio en vivo. CSV local es más estable para demos.",
-    )
-
-    st.markdown("### Búsqueda rápida")
-    query_sidebar = st.text_input(
+    query_input = st.text_input(
         "Consulta",
-        placeholder="Ej. agroecología en Colombia",
+        placeholder="Ej: agroecología, gender, drought Kenya",
         label_visibility="collapsed",
     )
+    buscar_btn = st.button("🔍  Buscar en ambas fuentes", use_container_width=True, type="primary")
 
-    buscar_btn = st.button("Buscar", use_container_width=True, type="primary")
+    if buscar_btn and query_input.strip():
+        terminos = expandir_consulta(query_input)
+        st.session_state.last_query = query_input
+        st.session_state.terminos   = terminos
 
-    if buscar_btn and query_sidebar.strip():
-        with st.spinner("Buscando..."):
-            df_res, terminos = ejecutar_busqueda(query_sidebar, fuente)
-        st.session_state.df_results = df_res
-        st.session_state.last_query = query_sidebar
-        st.session_state.terminos_usados = terminos
-        st.session_state.fuente_usada = fuente
+        with st.spinner("Buscando en CSV…"):
+            st.session_state.df_csv_results = buscar_csv(terminos)
+        with st.spinner("Consultando API…"):
+            st.session_state.df_api_results = buscar_api(terminos)
 
-    # Mostrar términos expandidos
-    if st.session_state.terminos_usados and len(st.session_state.terminos_usados) > 1:
-        st.markdown("**Términos de búsqueda usados:**")
-        st.caption(" · ".join(st.session_state.terminos_usados[:6]))
+    if st.session_state.terminos:
+        st.markdown("**Términos buscados:**")
+        st.caption("  ·  ".join(st.session_state.terminos[:6]))
+        if len(st.session_state.terminos) > 6:
+            st.caption(f"… y {len(st.session_state.terminos)-6} más")
 
     st.markdown("---")
-    st.markdown("**Filtros rápidos**")
-    st.caption("Aplican sobre los resultados actuales.")
+    if not df_csv_global.empty:
+        st.markdown(f"📂 **Base local:** {len(df_csv_global):,} docs")
+    else:
+        st.warning(f"RDS no encontrado.\nRuta esperada: `{RDS_PATH}`")
 
 
-# ──────────────────────────────────────────────
-# Header principal
-# ──────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
+# HEADER
+# ─────────────────────────────────────────────────────────────
 st.markdown("# CGSpace Explorer")
-st.caption(
-    "Explora la producción de conocimiento de CGIAR. "
-    "Busca por tema, país, año o tipo de documento."
-)
+if st.session_state.last_query:
+    st.caption(f"Consulta: **{st.session_state.last_query}**")
+else:
+    st.caption("Introduce una búsqueda en el panel izquierdo para comenzar.")
 st.markdown("---")
 
-# ──────────────────────────────────────────────
-# Tabs
-# ──────────────────────────────────────────────
-tab_resumen, tab_docs, tab_chat = st.tabs([
-    "📊 Resumen & Visualizaciones",
-    "📄 Documentos",
-    "💬 Consultas libres",
+tab_csv, tab_api, tab_chat = st.tabs([
+    "📂  Base local (CSV)",
+    "🌐  API CGSpace (en vivo)",
+    "💬  Consultas libres",
 ])
 
 
-# ══════════════════════════════════════════════
-# TAB 1 – Resumen & Visualizaciones
-# ══════════════════════════════════════════════
-with tab_resumen:
+# ─────────────────────────────────────────────────────────────
+# Función reutilizable de renderizado
+# ─────────────────────────────────────────────────────────────
+def render_resultados(df_raw: pd.DataFrame, fuente_label: str, tab_key: str):
+    """
+    Renderiza filtros → KPIs → visualizaciones → tabla para un DataFrame.
+    Todo lo que se muestra en pantalla proviene del mismo df filtrado.
+    """
+    if df_raw.empty and not st.session_state.last_query:
+        st.info("👈 Introduce una búsqueda en el panel izquierdo.")
+        return
 
-    df = st.session_state.df_results.copy()
-
-    # ── Si no hay búsqueda aún ──
-    if df.empty and not st.session_state.last_query:
-        st.info(
-            "👈 Escribe una consulta en la barra lateral para explorar los documentos de CGSpace.\n\n"
-            "**Ejemplos:** `agroecología`, `coffee rust Colombia`, `climate change Africa`, `food security`"
-        )
-        st.stop()
-
-    # ── Sin resultados ──
-    if df.empty:
+    if df_raw.empty:
         st.warning(
-            f"No se encontraron documentos para **{st.session_state.last_query}**. "
-            "Intenta con otros términos."
+            f"No se encontraron documentos para **{st.session_state.last_query}** "
+            f"en {fuente_label}. Prueba con otros términos."
         )
-        st.stop()
+        return
 
-    # ── Filtros post-búsqueda ──
+    # ── Filtros ──
     with st.expander("⚙️ Filtros", expanded=False):
         fc1, fc2, fc3 = st.columns(3)
 
-        # Año
-        if "Año" in df.columns and df["Año"].notna().any():
-            años = sorted(df["Año"].dropna().unique().astype(int).tolist())
+        year_range = None
+        if "year" in df_raw.columns and df_raw["year"].notna().any():
+            años = sorted(df_raw["year"].dropna().astype(int).unique().tolist())
             if len(años) > 1:
                 year_range = fc1.slider(
                     "Rango de años",
                     min_value=min(años), max_value=max(años),
                     value=(min(años), max(años)),
-                    key="res_year",
+                    key=f"{tab_key}_year",
                 )
-                df = df[df["Año"].between(year_range[0], year_range[1])]
+            else:
+                fc1.write(f"Año: **{años[0]}**")
 
-        # País
-        if "País" in df.columns:
-            paises = sorted(df["País"].dropna().unique().tolist())
+        paises_sel = None
+        if "country" in df_raw.columns:
+            paises = sorted(df_raw["country"].dropna().unique().tolist())
             if paises:
-                sel_paises = fc2.multiselect("País / Región", paises, default=paises, key="res_pais")
-                if sel_paises:
-                    df = df[df["País"].isin(sel_paises)]
+                paises_sel = fc2.multiselect(
+                    "País", paises, default=paises, key=f"{tab_key}_pais"
+                )
 
-        # Tipo
-        if "Tipo" in df.columns:
-            tipos = sorted(df["Tipo"].dropna().unique().tolist())
+        tipos_sel = None
+        if "type" in df_raw.columns:
+            tipos = sorted(df_raw["type"].dropna().unique().tolist())
             if tipos:
-                sel_tipos = fc3.multiselect("Tipo de documento", tipos, default=tipos, key="res_tipo")
-                if sel_tipos:
-                    df = df[df["Tipo"].isin(sel_tipos)]
+                tipos_sel = fc3.multiselect(
+                    "Tipo", tipos, default=tipos, key=f"{tab_key}_tipo"
+                )
 
-    # ── KPIs — todos calculados sobre df (filtrado) ──
-    total = len(df)
-    n_paises = df["País"].dropna().nunique() if "País" in df.columns else 0
-    año_max = int(df["Año"].max()) if "Año" in df.columns and df["Año"].notna().any() else "N/D"
-    año_min = int(df["Año"].min()) if "Año" in df.columns and df["Año"].notna().any() else "N/D"
-    temas_top = temas_frecuentes(df, top_n=1)
-    tema_1 = temas_top[0][0] if temas_top else "N/D"
+    # df es la ÚNICA fuente de verdad a partir de aquí
+    df = aplicar_filtros(df_raw, year_range, paises_sel, tipos_sel)
+
+    # ── KPIs ──
+    total    = len(df)
+    n_paises = df["country"].dropna().nunique() if "country" in df.columns else 0
+    n_tipos  = df["type"].dropna().nunique()    if "type"    in df.columns else 0
+    año_max  = int(df["year"].max()) if "year" in df.columns and df["year"].notna().any() else "N/D"
+    año_min  = int(df["year"].min()) if "year" in df.columns and df["year"].notna().any() else "N/D"
+    temas_t1 = extraer_temas(df, top_n=1)
+    tema_1   = temas_t1[0][0] if temas_t1 else "N/D"
 
     k1, k2, k3, k4, k5 = st.columns(5)
-    k1.metric("Documentos", total)
-    k2.metric("Países", n_paises)
-    k3.metric("Año más reciente", año_max)
-    k4.metric("Período cubierto", f"{año_min} – {año_max}" if isinstance(año_min, int) else "N/D")
-    k5.metric("Tema principal", tema_1)
-
-    st.caption(
-        f"Consulta: **{st.session_state.last_query}** · "
-        f"Fuente: {st.session_state.fuente_usada} · "
-        f"Términos usados: {', '.join(st.session_state.terminos_usados[:4])}"
-    )
+    k1.metric("Documentos",       f"{total:,}")
+    k2.metric("Países",           n_paises)
+    k3.metric("Tipos de doc.",    n_tipos)
+    k4.metric("Período",          f"{año_min}–{año_max}" if isinstance(año_min, int) else "N/D")
+    k5.metric("Tema principal",   tema_1)
 
     st.markdown("---")
 
     # ── Visualizaciones ──
-    col_izq, col_der = st.columns([1.1, 0.9])
+    col_izq, col_der = st.columns([1.15, 0.85])
 
-    # — Mapa de países —
     with col_izq:
         st.markdown("#### 🌍 Documentos por país")
-        if "País" in df.columns and df["País"].notna().any():
-            conteo_pais = (
-                df["País"]
-                .dropna()
+        if "country" in df.columns and df["country"].notna().any():
+            conteo = (
+                df["country"].dropna()
                 .value_counts()
                 .reset_index()
-                .rename(columns={"País": "País", "count": "Documentos"})
+                .rename(columns={"country": "País", "count": "Documentos"})
             )
             fig_mapa = px.choropleth(
-                conteo_pais,
+                conteo,
                 locations="País",
                 locationmode="country names",
                 color="Documentos",
                 color_continuous_scale="Greens",
-                title="",
-                height=380,
+                height=340,
             )
             fig_mapa.update_layout(
-                margin=dict(l=0, r=0, t=10, b=0),
-                coloraxis_colorbar=dict(title="Docs"),
+                margin=dict(l=0, r=0, t=5, b=0),
+                coloraxis_colorbar=dict(title=""),
             )
-            st.plotly_chart(fig_mapa, use_container_width=True)
+            st.plotly_chart(fig_mapa, use_container_width=True, key=f"{tab_key}_mapa")
 
-            # Top 5 países como tabla compacta
             st.dataframe(
-                conteo_pais.head(8).rename(columns={"País": "País", "Documentos": "Docs"}),
+                conteo.head(10),
                 use_container_width=True,
                 hide_index=True,
-                height=200,
+                height=220,
+                column_config={
+                    "Documentos": st.column_config.ProgressColumn(
+                        "Documentos", format="%d",
+                        min_value=0, max_value=int(conteo["Documentos"].max()),
+                    )
+                },
             )
         else:
-            st.info("Sin datos de países disponibles.")
+            st.info("Sin datos de países en esta búsqueda.")
 
-    # — Timeline —
     with col_der:
         st.markdown("#### 📅 Publicaciones por año")
-        if "Año" in df.columns and df["Año"].notna().any():
+        if "year" in df.columns and df["year"].notna().any():
             docs_año = (
-                df.groupby("Año")
-                .size()
+                df.groupby("year").size()
                 .reset_index(name="Documentos")
-                .sort_values("Año")
+                .sort_values("year")
             )
-            fig_time = px.bar(
-                docs_año,
-                x="Año", y="Documentos",
+            fig_t = px.bar(
+                docs_año, x="year", y="Documentos",
                 color_discrete_sequence=["#16a34a"],
-                height=250,
+                height=220,
             )
-            fig_time.update_layout(
-                margin=dict(l=0, r=0, t=10, b=0),
-                xaxis_title="",
-                yaxis_title="Docs",
-            )
-            st.plotly_chart(fig_time, use_container_width=True)
+            fig_t.update_layout(margin=dict(l=0, r=0, t=5, b=0), xaxis_title="")
+            st.plotly_chart(fig_t, use_container_width=True, key=f"{tab_key}_timeline")
         else:
-            st.info("Sin datos de año disponibles.")
+            st.info("Sin datos de año.")
 
         st.markdown("#### 🏷️ Temas más frecuentes")
-        temas_lista = temas_frecuentes(df, top_n=15)
+        temas_lista = extraer_temas(df, top_n=12)
         if temas_lista:
-            df_temas = pd.DataFrame(temas_lista, columns=["Tema", "Frecuencia"])
+            df_t = pd.DataFrame(temas_lista, columns=["Tema", "Docs"])
             fig_temas = px.bar(
-                df_temas.sort_values("Frecuencia"),
-                x="Frecuencia", y="Tema",
+                df_t.sort_values("Docs"),
+                x="Docs", y="Tema",
                 orientation="h",
-                color="Frecuencia",
+                color="Docs",
                 color_continuous_scale="Greens",
-                height=350,
+                height=320,
             )
             fig_temas.update_layout(
-                margin=dict(l=0, r=0, t=10, b=0),
-                showlegend=False,
+                margin=dict(l=0, r=0, t=5, b=0),
                 coloraxis_showscale=False,
                 yaxis_title="",
             )
-            st.plotly_chart(fig_temas, use_container_width=True)
+            st.plotly_chart(fig_temas, use_container_width=True, key=f"{tab_key}_temas")
         else:
-            st.info("Sin palabras clave en los metadatos.")
+            st.info("Sin palabras clave disponibles.")
+
+    st.markdown("---")
+
+    # ── Tabla ──
+    st.markdown(f"#### 📄 Documentos ({total:,})")
+
+    cols_tabla = [c for c in [
+        "title", "year", "type", "country",
+        "agrovoc_subject", "investor_funder_sponsor", "handle",
+    ] if c in df.columns]
+
+    st.dataframe(
+        df[cols_tabla].reset_index(drop=True),
+        use_container_width=True,
+        height=440,
+        column_config={
+            "title":                   st.column_config.TextColumn("Título", width="large"),
+            "year":                    st.column_config.NumberColumn("Año", format="%d", width="small"),
+            "type":                    st.column_config.TextColumn("Tipo", width="medium"),
+            "country":                 st.column_config.TextColumn("País", width="medium"),
+            "agrovoc_subject":         st.column_config.TextColumn("Temas (AGROVOC)", width="large"),
+            "investor_funder_sponsor": st.column_config.TextColumn("Financiador", width="medium"),
+            "handle":                  st.column_config.LinkColumn("Enlace", width="small"),
+        },
+    )
+
+    csv_bytes = df[cols_tabla].to_csv(index=False).encode("utf-8")
+    st.download_button(
+        label="⬇️ Descargar resultados (CSV)",
+        data=csv_bytes,
+        file_name=f"cgspace_{fuente_label.replace(' ', '_')}_{st.session_state.last_query[:20].replace(' ', '_')}.csv",
+        mime="text/csv",
+        key=f"{tab_key}_download",
+    )
 
 
-# ══════════════════════════════════════════════
-# TAB 2 – Documentos
-# ══════════════════════════════════════════════
-with tab_docs:
-    st.markdown("## Documentos encontrados")
-
-    df_docs = st.session_state.df_results.copy()
-
-    if df_docs.empty:
-        st.info("Realiza una búsqueda para ver los documentos.")
-    else:
-        # Filtros independientes en esta tab (no afectan la tab de resumen)
-        with st.expander("⚙️ Filtros", expanded=True):
-            d1, d2, d3 = st.columns(3)
-
-            if "Año" in df_docs.columns and df_docs["Año"].notna().any():
-                años_d = sorted(df_docs["Año"].dropna().unique().astype(int).tolist())
-                if len(años_d) > 1:
-                    yr = d1.slider(
-                        "Años",
-                        min_value=min(años_d), max_value=max(años_d),
-                        value=(min(años_d), max(años_d)),
-                        key="docs_year",
-                    )
-                    df_docs = df_docs[df_docs["Año"].between(yr[0], yr[1])]
-
-            if "País" in df_docs.columns:
-                paises_d = sorted(df_docs["País"].dropna().unique().tolist())
-                if paises_d:
-                    sp = d2.multiselect("País", paises_d, default=paises_d, key="docs_pais")
-                    if sp:
-                        df_docs = df_docs[df_docs["País"].isin(sp)]
-
-            if "Tipo" in df_docs.columns:
-                tipos_d = sorted(df_docs["Tipo"].dropna().unique().tolist())
-                if tipos_d:
-                    st_d = d3.multiselect("Tipo", tipos_d, default=tipos_d, key="docs_tipo")
-                    if st_d:
-                        df_docs = df_docs[df_docs["Tipo"].isin(st_d)]
-
-        st.markdown(f"**{len(df_docs)} documentos** coinciden con los filtros.")
-
-        # Columnas a mostrar (las que existan)
-        cols_mostrar = [
-            c for c in ["Título", "Año", "País", "Tipo", "Autores", "PalabrasClave", "Abstract", "Enlace"]
-            if c in df_docs.columns
-        ]
-
-        # Tabla interactiva
-        st.dataframe(
-            df_docs[cols_mostrar].reset_index(drop=True),
-            use_container_width=True,
-            height=500,
-            column_config={
-                "Enlace": st.column_config.LinkColumn("Enlace"),
-                "Título": st.column_config.TextColumn("Título", width="large"),
-                "Abstract": st.column_config.TextColumn("Abstract", width="medium"),
-            },
-        )
-
-        # Descarga
-        csv_bytes = df_docs[cols_mostrar].to_csv(index=False).encode("utf-8")
-        st.download_button(
-            label="⬇️ Descargar resultados (CSV)",
-            data=csv_bytes,
-            file_name=f"cgspace_{st.session_state.last_query[:30].replace(' ', '_')}.csv",
-            mime="text/csv",
-        )
+# ═════════════════════════════════════════════════════════════
+# TAB 1 – CSV LOCAL
+# ═════════════════════════════════════════════════════════════
+with tab_csv:
+    n = len(st.session_state.df_csv_results)
+    if n:
+        st.success(f"**{n:,} documentos** encontrados en la base local.")
+    render_resultados(st.session_state.df_csv_results, "Base local (CSV)", "csv")
 
 
-# ══════════════════════════════════════════════
-# TAB 3 – Chat / Consultas libres
-# ══════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════
+# TAB 2 – API CGSPACE
+# ═════════════════════════════════════════════════════════════
+with tab_api:
+    n = len(st.session_state.df_api_results)
+    if n:
+        st.success(f"**{n:,} documentos** encontrados en la API de CGSpace.")
+    render_resultados(st.session_state.df_api_results, "API CGSpace", "api")
+
+
+# ═════════════════════════════════════════════════════════════
+# TAB 3 – CHAT
+# ═════════════════════════════════════════════════════════════
 with tab_chat:
     st.markdown("## Consultas libres")
     st.caption(
-        "Escribe en lenguaje natural. El sistema interpretará tu consulta, "
-        "buscará en CGSpace y actualizará las visualizaciones."
+        "Escribe en lenguaje natural. El sistema buscará en ambas fuentes "
+        "y actualizará las pestañas de resultados."
     )
 
-    # Historial
     for msg in st.session_state.chat_history:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
 
-    user_input = st.chat_input("Ej: Documentos sobre café y cambio climático en Centroamérica")
+    user_input = st.chat_input(
+        "Ej: documentos sobre café y cambio climático en Centroamérica"
+    )
 
     if user_input:
         st.session_state.chat_history.append({"role": "user", "content": user_input})
         with st.chat_message("user"):
             st.markdown(user_input)
 
-        with st.spinner("Buscando..."):
-            df_new, terminos_new = ejecutar_busqueda(user_input, fuente)
-
-        st.session_state.df_results = df_new
+        terminos = expandir_consulta(user_input)
         st.session_state.last_query = user_input
-        st.session_state.terminos_usados = terminos_new
-        st.session_state.fuente_usada = fuente
+        st.session_state.terminos   = terminos
 
-        if df_new.empty:
-            respuesta = (
-                f"No se encontraron documentos para **{user_input}**.\n\n"
-                f"Términos buscados: {', '.join(terminos_new)}.\n\n"
-                "Prueba con términos más generales o en inglés."
+        with st.spinner("Buscando…"):
+            df_c = buscar_csv(terminos)
+            df_a = buscar_api(terminos)
+
+        st.session_state.df_csv_results = df_c
+        st.session_state.df_api_results = df_a
+
+        partes = []
+
+        if not df_c.empty:
+            años_c   = (f"{int(df_c['year'].min())}–{int(df_c['year'].max())}"
+                        if "year" in df_c.columns and df_c["year"].notna().any() else "N/D")
+            paises_c = df_c["country"].dropna().nunique() if "country" in df_c.columns else 0
+            partes.append(
+                f"**Base local:** {len(df_c):,} documentos · {paises_c} países · {años_c}"
             )
         else:
-            n = len(df_new)
-            paises_n = df_new["País"].dropna().nunique() if "País" in df_new.columns else 0
-            año_r = int(df_new["Año"].max()) if "Año" in df_new.columns and df_new["Año"].notna().any() else "N/D"
-            temas_n = temas_frecuentes(df_new, top_n=3)
-            temas_str = ", ".join([t[0] for t in temas_n]) if temas_n else "sin etiquetas"
+            partes.append("**Base local:** sin resultados.")
 
-            respuesta = (
-                f"Se encontraron **{n} documentos** en {st.session_state.fuente_usada}.\n\n"
-                f"- **Países cubiertos:** {paises_n}\n"
-                f"- **Publicación más reciente:** {año_r}\n"
-                f"- **Temas predominantes:** {temas_str}\n\n"
-                f"Las visualizaciones y la tabla se han actualizado. "
-                f"Ve a las pestañas **Resumen** o **Documentos** para explorar los resultados."
-            )
+        if not df_a.empty:
+            años_a = (f"{int(df_a['year'].min())}–{int(df_a['year'].max())}"
+                      if "year" in df_a.columns and df_a["year"].notna().any() else "N/D")
+            partes.append(f"**API CGSpace:** {len(df_a):,} documentos · {años_a}")
+        else:
+            partes.append("**API CGSpace:** sin resultados o servicio no disponible.")
+
+        respuesta = (
+            "\n\n".join(partes)
+            + f"\n\nTérminos buscados: `{', '.join(terminos[:5])}`\n\n"
+            "Ve a **Base local** o **API CGSpace** para explorar los resultados."
+        )
 
         st.session_state.chat_history.append({"role": "assistant", "content": respuesta})
         with st.chat_message("assistant"):
